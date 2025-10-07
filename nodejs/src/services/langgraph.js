@@ -56,7 +56,7 @@ const { z } = require('zod');
 const { createGeminiImageTool } = require('./geminiImageTool');
 
 // Create the DALL-E image generation tool with default API key
-const imageGenerationTool = createDallEImageTool(LINK.WEAM_OPEN_AI_KEY);
+const imageGenerationTool = createDallEImageTool();
 // Create the Gemini image generation tool with default API key
 const geminiImageTool = createGeminiImageTool();
 
