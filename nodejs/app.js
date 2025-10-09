@@ -116,7 +116,12 @@ require('./src/services/agenda');
 store(descriptor.listEndpoints(app));
 
 if (parseInt(config.SEED)) {
-    initSeed().then(() => logger.info('seeded successfully '));
+    initSeed()
+        .then(() => logger.info('Database seeding completed successfully! 🎉'))
+        .catch((error) => {
+            logger.error('Failed to seed database - application startup aborted:', error);
+            process.exit(1); // Exit with error code to prevent application from starting with incomplete data
+        });
 }
 
 module.exports = app;
