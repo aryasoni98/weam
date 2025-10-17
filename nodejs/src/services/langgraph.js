@@ -10,6 +10,7 @@ const { LINK } = require('../config/config');
 const { AI_MODAL_PROVIDER, MODAL_NAME , ANTHROPIC_MAX_TOKENS, PERPLEXITY_MODAL } = require('../config/constants/aimodal');
 const { ChatAnthropic } = require('@langchain/anthropic');
 const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
+const ollamaService = require('./ollamaService');
 const { SearxNGSearchTool } = require('./searchTool');
 const { createLLMConversation } = require('./thread');
 const { getConversationHistory } = require('./memoryService');
@@ -626,16 +627,26 @@ async function toolChatOpenRouterWithCallback(modelName, opts = {}, costCallback
 }
 
 async function llmFactory(modelName, opts = {}) {
+    // Debug logging to understand what provider is being used
+    console.log(`🔍 [LLM_FACTORY] Original provider: ${opts.llmProvider}, Model: ${modelName}`);
 
-    // Validate API key
-    if (!opts.apiKey) {
-        throw new Error('API key is required but not provided');
-    }
-    
-    // Ensure we have a valid provider, default to OPEN_AI if none specified
+    // Ensure we have a valid provider FIRST, default to OPEN_AI if none specified
     let provider = opts.llmProvider;
     if (!provider || !Object.values(AI_MODAL_PROVIDER).includes(provider)) {
+        console.log(`⚠️ [LLM_FACTORY] Invalid provider ${provider}, defaulting to OPEN_AI`);
         provider = AI_MODAL_PROVIDER.OPEN_AI;
+    }
+
+    console.log(`✅ [LLM_FACTORY] Final provider: ${provider}`);
+
+    // NOW validate API key (skip for providers that don't require it)
+    const skipKeyProviders = [AI_MODAL_PROVIDER.OLLAMA, AI_MODAL_PROVIDER.LOCAL_LLM];
+    const needsApiKey = !skipKeyProviders.includes(provider);
+
+    console.log(`🔑 [LLM_FACTORY] Provider ${provider} needs API key: ${needsApiKey}`);
+
+    if (needsApiKey && !opts.apiKey) {
+        throw new Error(`API key is required for ${provider} but not provided`);
     }
     
     // Create cost callback if threadId is provided
@@ -676,7 +687,7 @@ async function llmFactory(modelName, opts = {}) {
     }
     
     const llmConfig = {
-        [AI_MODAL_PROVIDER.OPEN_AI]: (() => {
+        [AI_MODAL_PROVIDER.OPEN_AI]: () => {
             // Check cache for simple model first
             const cacheKey = `openai_${modelName}_${needsTools}`;
             if (!needsTools && simpleModelCache.has(cacheKey)) {
@@ -710,18 +721,26 @@ async function llmFactory(modelName, opts = {}) {
             }
             
             return openAIModel;
-        })(),
-        [AI_MODAL_PROVIDER.ANTHROPIC]: (() => {
+        },
+        [AI_MODAL_PROVIDER.ANTHROPIC]: () => {
+            console.log(`🤖 [ANTHROPIC] Creating Anthropic model: ${modelName} with provider: ${provider}`);
+
+            // Validate that we have an API key for Anthropic
+            if (!opts.apiKey && !process.env.ANTHROPIC_API_KEY) {
+                console.error(`❌ [ANTHROPIC] No API key available for Anthropic`);
+                throw new Error(`Anthropic API key is required for ${AI_MODAL_PROVIDER.ANTHROPIC} provider`);
+            }
+
             // Check cache for simple model first
             const cacheKey = `anthropic_${modelName}_${needsTools}`;
             if (!needsTools && simpleModelCache.has(cacheKey)) {
                 return simpleModelCache.get(cacheKey);
             }
-            
+
             const anthropicModel = new ChatAnthropic({
                 ...baseConfig,
-                anthropicApiKey: opts.apiKey,
-            maxTokens: getAnthropicMaxTokens(modelName), // Model-specific max_tokens
+                anthropicApiKey: opts.apiKey || process.env.ANTHROPIC_API_KEY,
+                maxTokens: getAnthropicMaxTokens(modelName), // Model-specific max_tokens
             });
             
             // Only bind tools if query needs them
@@ -735,8 +754,8 @@ async function llmFactory(modelName, opts = {}) {
             }
             
             return anthropicModel;
-        })(),
-        [AI_MODAL_PROVIDER.GEMINI]: (() => {
+        },
+        [AI_MODAL_PROVIDER.GEMINI]: () => {
             try {
                 // Check cache for simple model first
                 const cacheKey = `gemini_${modelName}_${needsTools}`;
@@ -765,38 +784,247 @@ async function llmFactory(modelName, opts = {}) {
                 logger.error(`❌ [GEMINI] Failed to create ChatGoogleGenerativeAI:`, error);
                 throw error;
             }
-        })(),
-        [AI_MODAL_PROVIDER.DEEPSEEK]: await chatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback),
-        [AI_MODAL_PROVIDER.LLAMA4]: await toolChatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback, selectedTools),
-        [AI_MODAL_PROVIDER.GROK]: await toolChatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback, selectedTools),
-        [AI_MODAL_PROVIDER.QWEN]: await chatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback),
-        [AI_MODAL_PROVIDER.PERPLEXITY]: (() => {
-            // Return a special object that will be handled by perplexityRawStream
+        },
+        [AI_MODAL_PROVIDER.DEEPSEEK]: () => chatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback),
+        [AI_MODAL_PROVIDER.LLAMA4]: () => toolChatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback, selectedTools),
+        [AI_MODAL_PROVIDER.GROK]: () => toolChatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback, selectedTools),
+        [AI_MODAL_PROVIDER.QWEN]: () => chatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback),
+        [AI_MODAL_PROVIDER.OLLAMA]: () => {
+            // For Docker containers, use host.docker.internal to access host machine
+            const defaultBaseUrl = LINK.OLLAMA_COMMON_URL;
+            const baseUrl = opts.baseUrl || process.env.OLLAMA_URL || defaultBaseUrl;
+
+            console.log(`🤖 [OLLAMA] Creating Ollama model: ${modelName} with baseUrl: ${baseUrl}`);
+
             return {
-                _isPerplexityRaw: true,
-                model: modelName,
-                apiKey: opts.apiKey,
-                streaming: opts.streaming ?? true,
-                temperature: opts.temperature ?? 0.7,
-                maxTokens: opts.maxTokens || null,
-                search_recency_filter: 'month',
-                search_domain_filter: Array.isArray(opts.searchDomains) ? opts.searchDomains : undefined,
-                web_search_options: opts.web_search_options,
-                extra_body: opts.extra_body,
-                costCallback: costCallback,
-                threadId: opts.threadId
+                _costCallback: costCallback,
+                async invoke(context) {
+                    // Convert LangChain messages to Ollama chat format when possible
+                    const messages = (context || []).map(msg => {
+                        try {
+                            if (Array.isArray(msg)) {
+                                return { role: msg[0], content: msg[1] };
+                            }
+                            const ctor = msg?.constructor?.name || '';
+                            if (ctor === 'HumanMessage') return { role: 'user', content: msg.content };
+                            if (ctor === 'AIMessage') return { role: 'assistant', content: msg.content };
+                            if (ctor === 'SystemMessage') return { role: 'system', content: msg.content };
+                            // Fallback
+                            return { role: 'user', content: msg?.content || '' };
+                        } catch {
+                            return { role: 'user', content: '' };
+                        }
+                    });
+
+                    // Prefer chat if multiple messages exist, else use generate with last user content
+                    try {
+                        console.log(`🔍 [OLLAMA] Invoking with ${messages.length} messages, baseUrl: ${baseUrl}`);
+
+                        if (messages.length > 1) {
+                            console.log(`🔍 [OLLAMA] Using chat mode with messages:`, JSON.stringify(messages, null, 2));
+                            const res = await ollamaService.chat({
+                                messages,
+                                model: modelName,
+                                baseUrl,
+                                stream: false,
+                                userId: opts.userId,
+                                companyId: opts.companyRedisId,
+                                options: { temperature: baseConfig.temperature }
+                            });
+
+                            const text = res?.text || res?.response || res?.content || '';
+
+
+                            // Simulate streaming by emitting the complete response as chunks
+                            // This makes Ollama compatible with the streaming interface
+                            // Skip socket emission during title generation
+                            if (global.currentSocket && text && !opts.isTitleGeneration) {
+                                // Split text into words for pseudo-streaming effect
+                                const words = text.split(' ');
+                                for (let i = 0; i < words.length; i++) {
+                                    const chunk = i === 0 ? words[i] : ' ' + words[i];
+                                    global.currentSocket.emit('llmresponsesend', { chunk: chunk });
+                                    // Small delay to simulate streaming
+                                    await new Promise(resolve => setTimeout(resolve, 50));
+                                }
+
+                                // Emit completion signal after streaming is done
+                                global.currentSocket.emit('llmresponsesend', {
+                                    chunk: '',
+                                    proccedMsg: text,
+                                    done: true
+                                });
+                                
+                                // Add an explicit socket event for completion to ensure client receives it
+                                global.currentSocket.emit('llmresponsedone', {
+                                    messageId: opts.messageId,
+                                    chatId: opts.chatId,
+                                    text: text
+                                });
+                                
+                                // Trigger title generation for Ollama models
+                                if (opts.query && opts.chatId) {
+                                    console.log(`🔍 [OLLAMA] Triggering title generation for chat: ${opts.chatId}`);
+                                    global.currentSocket.emit(SOCKET_EVENTS.GENERATE_TITLE_BY_LLM, {
+                                        query: opts.query,
+                                        code: AI_MODAL_PROVIDER.OLLAMA,
+                                        apiKey: opts.baseUrl || null,
+                                        chatId: opts.chatId
+                                    });
+                                }
+                                
+                                // Save the Ollama response to the database
+                                try {
+                                    const { createLLMConversation } = require('./thread');
+                                    await createLLMConversation({
+                                        query: opts.query || messages.find(m => m.role === 'user')?.content || '',
+                                        answer: text,
+                                        chatId: opts.chatId,
+                                        messageId: opts.messageId,
+                                        usedCredit: 1,
+                                        responseModel: modelName,
+                                        responseAPI: 'ollama',
+                                        apiKey: opts.apiKey,
+                                        user: opts.user,
+                                        companyId: opts.companyId,
+                                        promptId: opts.promptId,
+                                        customGptId: opts.customGptId
+                                    });
+                                    console.log(`✅ [OLLAMA] Response saved to database successfully`);
+                                } catch (saveError) {
+                                    console.error(`❌ [OLLAMA] Error saving response to database:`, saveError);
+                                }
+                                
+                                console.log(`✅ [OLLAMA] Streaming complete with done signal and explicit llmresponsedone event`);
+                            }
+
+                            return { content: text };
+                        } else {
+                            const last = messages[messages.length - 1] || { role: 'user', content: '' };
+                            console.log(`🔍 [OLLAMA] Using generate mode with prompt: "${last.content}"`);
+                            const res = await ollamaService.generate({
+                                prompt: last.content || '',
+                                model: modelName,
+                                baseUrl,
+                                stream: false,
+                                userId: opts.userId,
+                                companyId: opts.companyRedisId,
+                                options: { temperature: baseConfig.temperature }
+                            });
+                            console.log(`🔍 [OLLAMA] Generate response:`, JSON.stringify(res, null, 2));
+                            const text = res?.text || res?.response || res?.content || '';
+                            console.log(`🔍 [OLLAMA] Extracted text: "${text}"`);
+
+                            // Simulate streaming by emitting the complete response as chunks
+                            // This makes Ollama compatible with the streaming interface
+                            // Skip socket emission during title generation
+                            if (global.currentSocket && text && !opts.isTitleGeneration) {
+                                console.log(`📡 [OLLAMA] Emitting response via socket streaming`);
+                                // Split text into words for pseudo-streaming effect
+                                const words = text.split(' ');
+                                for (let i = 0; i < words.length; i++) {
+                                    const chunk = i === 0 ? words[i] : ' ' + words[i];
+                                    global.currentSocket.emit('llmresponsesend', { chunk: chunk });
+                                    // Small delay to simulate streaming
+                                    await new Promise(resolve => setTimeout(resolve, 50));
+                                }
+
+                                // Emit completion signal after streaming is done
+                                global.currentSocket.emit('llmresponsesend', {
+                                    chunk: '',
+                                    proccedMsg: text,
+                                    done: true
+                                });
+                                
+                                // Add an explicit socket event for completion to ensure client receives it
+                                global.currentSocket.emit('llmresponsedone', {
+                                    messageId: opts.messageId,
+                                    chatId: opts.chatId,
+                                    text: text
+                                });
+                                
+                                // Trigger title generation for Ollama models
+                                if (opts.query && opts.chatId) {
+                                    console.log(`🔍 [OLLAMA] Triggering title generation for chat: ${opts.chatId}`);
+                                    global.currentSocket.emit(SOCKET_EVENTS.GENERATE_TITLE_BY_LLM, {
+                                        query: opts.query,
+                                        code: AI_MODAL_PROVIDER.OLLAMA,
+                                        apiKey: opts.baseUrl || null,
+                                        chatId: opts.chatId
+                                    });
+                                }
+                                
+                                // Save the Ollama response to the database
+                                try {
+                                    const { createLLMConversation } = require('./thread');
+                                    await createLLMConversation({
+                                        query: opts.query || last.content || '',
+                                        answer: text,
+                                        chatId: opts.chatId,
+                                        messageId: opts.messageId,
+                                        usedCredit: 1,
+                                        responseModel: modelName,
+                                        responseAPI: 'ollama',
+                                        apiKey: opts.apiKey,
+                                        user: opts.user,
+                                        companyId: opts.companyId,
+                                        promptId: opts.promptId,
+                                        customGptId: opts.customGptId
+                                    });
+                                    console.log(`✅ [OLLAMA] Response saved to database successfully`);
+                                } catch (saveError) {
+                                    console.error(`❌ [OLLAMA] Error saving response to database:`, saveError);
+                                }
+                                
+                                console.log(`✅ [OLLAMA] Streaming complete with done signal and explicit llmresponsedone event`);
+                            }
+
+                            return { content: text };
+                        }
+                    } catch (error) {
+                        logger.error('❌ [OLLAMA] Invocation error:', error);
+                        // Provide a friendly message similar to other providers
+                        return { content: 'Ollama is unreachable or failed to respond. Please ensure your Ollama server is running.' };
+                    }
+                }
             };
-        })(),
+        },
+        [AI_MODAL_PROVIDER.DEEPSEEK]: () => chatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback),
+        [AI_MODAL_PROVIDER.LLAMA4]: () => toolChatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback, selectedTools),
+        [AI_MODAL_PROVIDER.GROK]: () => toolChatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback, selectedTools),
+        [AI_MODAL_PROVIDER.QWEN]: () => chatOpenRouterWithCallback(modelName, { ...opts, apiKey: opts.apiKey }, costCallback),
+        [AI_MODAL_PROVIDER.PERPLEXITY]: () => ({
+            _isPerplexityRaw: true,
+            model: modelName,
+            apiKey: opts.apiKey,
+            streaming: opts.streaming ?? true,
+            temperature: opts.temperature ?? 0.7,
+            maxTokens: opts.maxTokens || null,
+            search_recency_filter: 'month',
+            search_domain_filter: Array.isArray(opts.searchDomains) ? opts.searchDomains : undefined,
+            web_search_options: opts.web_search_options,
+            extra_body: opts.extra_body,
+            costCallback: costCallback,
+            threadId: opts.threadId
+        }),
     }
     
-    
-    const selectedLLM = llmConfig[provider];
-    if (!selectedLLM) {
-        logger.error(`❌ [LLM_FACTORY] No LLM configuration found for provider: ${provider}`);
-        logger.error('Available providers:', Object.keys(llmConfig));
-        logger.error('Using fallback to OpenAI');
-        return llmConfig[AI_MODAL_PROVIDER.OPEN_AI];
+
+    console.log(`🔍 [LLM_FACTORY] Looking for provider ${provider} in llmConfig`);
+    console.log(`🔍 [LLM_FACTORY] Available providers:`, Object.keys(llmConfig));
+
+    const selectedLLMFactory = llmConfig[provider];
+    if (!selectedLLMFactory) {
+        console.error(`❌ [LLM_FACTORY] No LLM configuration found for provider: ${provider}`);
+        console.error('Available providers:', Object.keys(llmConfig));
+        console.error('Using fallback to OpenAI');
+        return await llmConfig[AI_MODAL_PROVIDER.OPEN_AI]();
     }
+
+    console.log(`✅ [LLM_FACTORY] Selected LLM factory for provider: ${provider}`);
+
+    // Call the factory function to create the LLM
+    const selectedLLM = await selectedLLMFactory();
     
     
     // Store callback reference on LLM for later access if needed
@@ -1368,6 +1596,7 @@ async function getAgentModelConfig(agentDetails, data) {
                 model: responseModel.name,
                 apiKey: data.apiKey,
                 llmProvider: inferredProvider,
+                baseUrl: responseModel.config?.baseUrl ? safeDecryptApiKey(responseModel.config.baseUrl) : undefined,
                 temperature: 0.7,
                 streaming: true
             };
@@ -1423,7 +1652,8 @@ function mapProviderCode(code) {
         'azure': AI_MODAL_PROVIDER.AZURE_OPENAI_SERVICE,
         'huggingface': AI_MODAL_PROVIDER.HUGGING_FACE,
         'local': AI_MODAL_PROVIDER.LOCAL_LLM,
-        'anyscale': AI_MODAL_PROVIDER.ANYSCALE
+        'anyscale': AI_MODAL_PROVIDER.ANYSCALE,
+        'ollama': AI_MODAL_PROVIDER.OLLAMA
     };
     
     // Check exact matches first
@@ -1441,6 +1671,11 @@ function mapProviderCode(code) {
 }
 
 async function toolExecutor(data, socket) {
+
+
+    // Make socket available globally for Ollama streaming
+    global.currentSocket = socket;
+
     try {
         let apiKey, model, app, agentDetails = null;
 
@@ -1453,8 +1688,25 @@ async function toolExecutor(data, socket) {
             streaming: true,
             query: data.query,
             threadId: data.threadId,
-            userId: data.user.id
+            userId: data.user.id,
+            chatId: data.chatId,
+            messageId: data.messageId,
+            user: data.user,
+            companyId: data.companyId || data.user?.company?.id,
+            promptId: data.promptId,
+            customGptId: data.customGptId
         };
+        // Inject Ollama baseUrl from company settings when applicable
+        if (mappedProvider === AI_MODAL_PROVIDER.OLLAMA) {
+            try {
+                const companyId = data.companyId || data.user?.company?.id;
+                const settings = await ollamaService.getCompanyOllamaSettings(companyId);
+                const resolvedBaseUrl = settings?.baseUrl || LINK.OLLAMA_API_URL;
+                options.baseUrl = resolvedBaseUrl;
+            } catch (e) {
+                options.baseUrl = LINK.OLLAMA_API_URL;
+            }
+        }
         // RAW Perplexity routing for all Perplexity models
         const isPerplexity = mappedProvider === AI_MODAL_PROVIDER.PERPLEXITY;
         if (isPerplexity) {
@@ -1490,21 +1742,43 @@ async function toolExecutor(data, socket) {
                     // Map the agent's provider to the correct format
                     const mappedAgentProvider = mapProviderCode(agentModelConfig.llmProvider);
                     
-                    model = await llmFactory(agentModelConfig.model, {...options, apiKey: apiKey});
+                    const factoryOpts = { ...options, apiKey: apiKey };
+                    if (mappedAgentProvider === AI_MODAL_PROVIDER.OLLAMA && agentModelConfig.baseUrl) {
+                        factoryOpts.baseUrl = agentModelConfig.baseUrl;
+                    }
+                    model = await llmFactory(agentModelConfig.model, factoryOpts);
                 } else {
                     // Fallback to user's model configuration
-                    apiKey = safeDecryptApiKey(data.apiKey);
-                    model = await llmFactory(data.model, {...options, apiKey: apiKey});
+                    if (mappedProvider === AI_MODAL_PROVIDER.OLLAMA) {
+                        // For Ollama, apiKey field contains the baseUrl, not an encrypted key
+                        apiKey = null; // No API key needed for Ollama
+                        model = await llmFactory(data.model, options);
+                    } else {
+                        apiKey = safeDecryptApiKey(data.apiKey);
+                        model = await llmFactory(data.model, {...options, apiKey: apiKey});
+                    }
                 }
             } else {
                 // Agent not found, use user's model configuration
-                apiKey = decryptedData(data.apiKey);
-                model = await llmFactory(data.model, {...options, apiKey: apiKey});
+                if (mappedProvider === AI_MODAL_PROVIDER.OLLAMA) {
+                    // For Ollama, apiKey field contains the baseUrl, not an encrypted key
+                    apiKey = null; // No API key needed for Ollama
+                    model = await llmFactory(data.model, options);
+                } else {
+                    apiKey = decryptedData(data.apiKey);
+                    model = await llmFactory(data.model, {...options, apiKey: apiKey});
+                }
             }
         } else {
             // Normal flow: use user's model configuration
-            apiKey = decryptedData(data.apiKey);
-            model = await llmFactory(data.model, {...options, apiKey: apiKey});
+            if (mappedProvider === AI_MODAL_PROVIDER.OLLAMA) {
+                // For Ollama, apiKey field contains the baseUrl, not an encrypted key
+                apiKey = null; // No API key needed for Ollama
+                model = await llmFactory(data.model, options);
+            } else {
+                apiKey = decryptedData(data.apiKey);
+                model = await llmFactory(data.model, {...options, apiKey: apiKey});
+            }
         }
         
         // Build the graph with the selected model and agent details
@@ -1517,6 +1791,7 @@ async function toolExecutor(data, socket) {
         logger.error('Error in toolExecutor:', error);
     }
 }
+
 
 async function generateTitleByLLM(payload) {
     try {
@@ -1848,5 +2123,5 @@ module.exports = {
     imageGenerationTool,
     currentTimeTool,
     enhancePromptByLLM,
-    llmFactory
+    llmFactory,
 }
